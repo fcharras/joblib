@@ -58,7 +58,6 @@ from joblib._parallel_backends import ThreadingBackend
 from joblib._parallel_backends import MultiprocessingBackend
 from joblib._parallel_backends import ParallelBackendBase
 from joblib._parallel_backends import LokyBackend
-from joblib._parallel_backends import SafeFunction
 
 from joblib.parallel import Parallel, delayed
 from joblib.parallel import register_parallel_backend, parallel_backend
@@ -267,7 +266,8 @@ def nested_loop(backend):
 
 @parametrize('child_backend', BACKENDS)
 @parametrize('parent_backend', BACKENDS)
-def test_nested_loop(parent_backend, child_backend):
+@parametrize('return_generator', [True, False])
+def test_nested_loop(parent_backend, child_backend, return_generator):
     Parallel(n_jobs=2, backend=parent_backend)(
         delayed(nested_loop)(child_backend) for _ in range(2))
 
@@ -369,7 +369,8 @@ def test_error_capture(backend):
             Parallel(n_jobs=2, backend=backend)(
                 [delayed(division)(x, y)
                     for x, y in zip((0, 1), (1, 0))])
-        with raises(WorkerInterrupt):
+
+        with raises(KeyboardInterrupt):
             Parallel(n_jobs=2, backend=backend)(
                 [delayed(interrupt_raiser)(x) for x in (1, 0)])
 
@@ -393,7 +394,7 @@ def test_error_capture(backend):
                     parallel(delayed(f)(x, y=1) for x in range(10)))
 
             original_workers = get_workers(parallel._backend)
-            with raises(WorkerInterrupt):
+            with raises(KeyboardInterrupt):
                 parallel([delayed(interrupt_raiser)(x) for x in (1, 0)])
 
             # The pool should still be available despite the exception
@@ -817,11 +818,13 @@ def test_backend_nesting_level(outer_backend, inner_backend):
 
 
 @with_multiprocessing
-def test_retrieval_context():
+@parametrize('fetch_result_to_callback', [True, False])
+def test_retrieval_context(fetch_result_to_callback):
     import contextlib
 
     class MyBackend(ThreadingBackend):
         i = 0
+        supports_fetch_result_to_callback = fetch_result_to_callback
 
         @contextlib.contextmanager
         def retrieval_context(self):
@@ -850,16 +853,6 @@ def test_joblib_exception():
     repr(e)
     # Test the pickle
     pickle.dumps(e)
-
-
-def test_safe_function():
-    safe_division = SafeFunction(division)
-    with raises(ZeroDivisionError):
-        safe_division(1, 0)
-
-    safe_interrupt = SafeFunction(interrupt_raiser)
-    with raises(WorkerInterrupt):
-        safe_interrupt('x')
 
 
 @parametrize('batch_size', [0, -1, 1.42])
@@ -1170,16 +1163,21 @@ def test_memmap_with_big_offset(tmpdir):
     np.testing.assert_array_equal(obj, result)
 
 
-def test_warning_about_timeout_not_supported_by_backend():
-    with warns(None) as warninfo:
-        Parallel(timeout=1)(delayed(square)(i) for i in range(50))
-    assert len(warninfo) == 1
-    w = warninfo[0]
-    assert isinstance(w.message, UserWarning)
-    assert str(w.message) == (
-        "The backend class 'SequentialBackend' does not support timeout. "
-        "You have set 'timeout=1' in Parallel but the 'timeout' parameter "
-        "will not be used.")
+def set_list_value(input_list, index, value):
+    input_list[index] = value
+    return value
+
+
+def test_parallel_return_generator():
+    # This test inserts values in a list in some expected order
+    # in sequential computing, and then check that this order has been
+    # respectted by Parallel output generator.
+    with Parallel(n_jobs=1, return_generator=True) as parallel:
+        input_list = [0] * 5
+        result = parallel(
+            delayed(set_list_value)(input_list, i, i) for i in range(5))
+        for i, each in enumerate(result):
+            assert input_list[i] == each
 
 
 @parametrize('backend', ALL_VALID_BACKENDS)
@@ -1192,6 +1190,36 @@ def test_abort_backend(n_jobs, backend):
             delayed(time.sleep)(i) for i in delays)
     dt = time.time() - t_start
     assert dt < 20
+
+
+def get_large_object(arg):
+    result = np.ones(int(5 * 1e5), dtype=bool)
+    result[0] = False
+    return result
+
+
+@with_numpy
+@parametrize('backend', BACKENDS)
+@parametrize('n_jobs', [1, 2, -2, -1])
+def test_deadlock_with_generator(backend, n_jobs):
+    # Non-regression test for a race condition in the backends when the pickler
+    # is delayed by a large object.
+    with Parallel(n_jobs=n_jobs, backend=backend,
+                  return_generator=True) as parallel:
+        result = parallel(delayed(get_large_object)(i) for i in range(10))
+        next(result)
+        next(result)
+        del result
+
+
+def test_multiple_generator_call():
+    # Non-regression test that ensures the dispatch of the tasks starts
+    # immediately when Parallel.__call__ is called.
+    with raises(ValueError):
+        with Parallel(2, return_generator=True) as parallel:
+            gen = parallel(delayed(sleep)(1) for _ in range(10))
+            gen2 = parallel(delayed(id)(i) for i in range(100))
+            list(gen), list(gen2)
 
 
 @with_numpy
@@ -1481,7 +1509,7 @@ def test_thread_bomb_mitigation(backend):
         # Local import because loky may not be importable for lack of
         # multiprocessing
         from joblib.externals.loky.process_executor import TerminatedWorkerError # noqa
-        if isinstance(exc, TerminatedWorkerError):
+        if isinstance(exc, (TerminatedWorkerError, PicklingError)):
             # The recursion exception can itself cause an error when
             # pickling it to be send back to the parent process. In this
             # case the worker crashes but the original traceback is still
@@ -1491,7 +1519,6 @@ def test_thread_bomb_mitigation(backend):
             pytest.xfail("Loky worker crash when serializing RecursionError")
     else:
         assert isinstance(exc, RecursionError)
-
 
 def _run_parallel_sum():
     env_vars = {}
