@@ -6,11 +6,10 @@ import gc
 import os
 import warnings
 import threading
-import functools
 import contextlib
 from abc import ABCMeta, abstractmethod
 
-from .my_exceptions import WorkerInterrupt
+
 from ._multiprocessing_helpers import mp
 
 if mp is not None:
@@ -18,18 +17,20 @@ if mp is not None:
     from multiprocessing.pool import ThreadPool
     from .executor import get_memmapping_executor
 
-    # Compat between concurrent.futures and multiprocessing TimeoutError
-    from multiprocessing import TimeoutError
-    from concurrent.futures._base import TimeoutError as CfTimeoutError
+    # Import loky only if multiprocessing is present
     from .externals.loky import process_executor, cpu_count
+    from .externals.loky.process_executor import ShutdownExecutorError
+    from .externals.loky.process_executor import _ExceptionWithTraceback
 
 
 class ParallelBackendBase(metaclass=ABCMeta):
     """Helper abc which defines all methods a ParallelBackend must implement"""
 
     supports_timeout = False
+    supports_sharedmem = False
     supports_inner_max_num_threads = False
-    supports_fetch_result_to_callback = False
+    supports_asynchronous_callback = False
+
     nesting_level = None
 
     def __init__(self, nesting_level=None, inner_max_num_threads=None,
@@ -68,10 +69,12 @@ class ParallelBackendBase(metaclass=ABCMeta):
     def apply_async(self, func, callback=None):
         """Schedule a func to be run"""
 
-    def fetch_result_to_callback(self, out):
-        """Intended to be called within the callback function passed in
-        apply_async. It takes as input both the object returned by apply_async
-        (job) and the object passed to the callback function (out)."""
+    def fetch_result_callback(self, out):
+        """Called within the callback function passed in apply_async.
+
+        This is typically used to rebuild and raise exceptions wrapped
+        inside the out object.
+        """
 
     def configure(self, n_jobs=1, parallel=None, prefer=None, require=None,
                   **backend_args):
@@ -201,7 +204,7 @@ class SequentialBackend(ParallelBackendBase):
     """
 
     uses_threads = True
-    supports_fetch_result_to_callback = True
+    supports_asynchronous_callback = True
     supports_sharedmem = True
 
     def effective_n_jobs(self, n_jobs):
@@ -212,13 +215,10 @@ class SequentialBackend(ParallelBackendBase):
 
     def apply_async(self, func, callback=None):
         """Schedule a func to be run"""
-        result = DelayedResult(func)
-        if callback:
-            callback(result)
-        return result
+        raise RuntimeError("Should never be called for SequentialBackend.")
 
-    def fetch_result_to_callback(self, out):
-        return dict(status="Done", result=out)
+    def fetch_result_callback(self, out):
+        raise RuntimeError("Should never be called for SequentialBackend.")
 
     def get_nested_backend(self):
         # import is not top level to avoid cyclic import errors.
@@ -257,12 +257,31 @@ class PoolManagerMixin(object):
         """Used by apply_async to make it possible to implement lazy init"""
         return self._pool
 
+    @staticmethod
+    def _wrap_func_call(func):
+        """Protect function call and return error with traceback."""
+        try:
+            return func()
+        except BaseException as e:
+            return _ExceptionWithTraceback(e)
+
     def apply_async(self, func, callback=None):
         """Schedule a func to be run"""
+        # Here, we need a wrapper to avoid crashes on KeyboardInterruptErrors.
+        # We also call the callback on error, to make sure the pool does not
+        # wait on crashed jobs.
         return self._get_pool().apply_async(
-            func, callback=callback)
+            self._wrap_func_call, (func,),
+            callback=callback, error_callback=callback
+        )
 
-    def fetch_result_to_callback(self, out):
+    def fetch_result_callback(self, out):
+        """Mimic concurrent.futures results, raising an error if needed."""
+        if isinstance(out, _ExceptionWithTraceback):
+            rebuild, args = out.__reduce__()
+            out = rebuild(*args)
+        if isinstance(out, BaseException):
+            raise out
         return out
 
     def abort_everything(self, ensure_ready=True):
@@ -395,7 +414,7 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
     ThreadingBackend is used as the default backend for nested calls.
     """
 
-    supports_fetch_result_to_callback = True
+    supports_asynchronous_callback = True
     uses_threads = True
     supports_sharedmem = True
 
@@ -405,7 +424,8 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
         if n_jobs == 1:
             # Avoid unnecessary overhead and use sequential backend instead.
             raise FallbackToBackend(
-                SequentialBackend(nesting_level=self.nesting_level))
+                SequentialBackend(nesting_level=self.nesting_level)
+            )
         self.parallel = parallel
         self._n_jobs = n_jobs
         return n_jobs
@@ -430,7 +450,7 @@ class MultiprocessingBackend(PoolManagerMixin, AutoBatchingMixin,
     However, does not suffer from the Python Global Interpreter Lock.
     """
 
-    supports_fetch_result_to_callback = True
+    supports_asynchronous_callback = True
 
     def effective_n_jobs(self, n_jobs):
         """Determine the number of jobs which are going to run in parallel.
@@ -488,7 +508,8 @@ class MultiprocessingBackend(PoolManagerMixin, AutoBatchingMixin,
         n_jobs = self.effective_n_jobs(n_jobs)
         if n_jobs == 1:
             raise FallbackToBackend(
-                SequentialBackend(nesting_level=self.nesting_level))
+                SequentialBackend(nesting_level=self.nesting_level)
+            )
 
         # Make sure to free as much memory as possible before forking
         gc.collect()
@@ -505,7 +526,7 @@ class MultiprocessingBackend(PoolManagerMixin, AutoBatchingMixin,
 class LokyBackend(AutoBatchingMixin, ParallelBackendBase):
     """Managing pool of workers with loky instead of multiprocessing."""
 
-    supports_fetch_result_to_callback = True
+    supports_asynchronous_callback = True
     supports_inner_max_num_threads = True
 
     def configure(self, n_jobs=1, parallel=None, prefer=None, require=None,
@@ -514,7 +535,8 @@ class LokyBackend(AutoBatchingMixin, ParallelBackendBase):
         n_jobs = self.effective_n_jobs(n_jobs)
         if n_jobs == 1:
             raise FallbackToBackend(
-                SequentialBackend(nesting_level=self.nesting_level))
+                SequentialBackend(nesting_level=self.nesting_level)
+            )
 
         self._workers = get_memmapping_executor(
             n_jobs, timeout=idle_worker_timeout,
@@ -571,8 +593,17 @@ class LokyBackend(AutoBatchingMixin, ParallelBackendBase):
             future.add_done_callback(callback)
         return future
 
-    def fetch_result_to_callback(self, out):
-        return out.result()
+    def fetch_result_callback(self, out):
+        try:
+            return out.result()
+        except ShutdownExecutorError:
+            raise RuntimeError(
+                "The executor underlying Parallel has been shutdown. "
+                "This is likely due to the garbage collection of a previous "
+                "generator from a call to Parallel with return_generator=True."
+                " Make sure the generator is not garbage collected when "
+                "submitting a new job or that it is first properly exhausted."
+            )
 
     def terminate(self):
         if self._workers is not None:
@@ -594,22 +625,6 @@ class LokyBackend(AutoBatchingMixin, ParallelBackendBase):
 
         if ensure_ready:
             self.configure(n_jobs=self.parallel.n_jobs, parallel=self.parallel)
-
-
-class DelayedResult(object):
-    def __init__(self, batch):
-        # Don't delay the application, to avoid keeping the input
-        # arguments in memory
-        self.results = batch
-
-    def register_callback(self, cb):
-        self.cb = cb
-
-    def get(self):
-        ret = self.results()
-        if hasattr(self, "cb"):
-            self.cb()
-        return ret
 
 
 class FallbackToBackend(Exception):
