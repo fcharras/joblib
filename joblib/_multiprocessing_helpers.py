@@ -14,6 +14,7 @@ mp = int(os.environ.get('JOBLIB_MULTIPROCESSING', 1)) or None
 if mp:
     try:
         import multiprocessing as mp
+        import _multiprocessing  # noqa
     except ImportError:
         mp = None
 
@@ -21,19 +22,32 @@ if mp:
 #            issue a warning if not
 if mp is not None:
     try:
-        _sem = mp.Semaphore()
-        del _sem  # cleanup
-    except (ImportError, OSError) as e:
+        # try to create a named semaphore using SemLock to make sure they are
+        # available on this platform. We use the low level object
+        # _multiprocessing.SemLock to avoid spawning a resource tracker on
+        # Unix system or changing the default backend.
+        import tempfile
+        from _multiprocessing import SemLock
+
+        _rand = tempfile._RandomNameSequence()
+        for i in range(100):
+            try:
+                name = '/joblib-{}-{}' .format(
+                    os.getpid(), next(_rand))
+                _sem = SemLock(0, 0, 1, name=name, unlink=True)
+                del _sem  # cleanup
+                break
+            except FileExistsError as e:  # pragma: no cover
+                if i >= 99:
+                    raise FileExistsError(
+                        'cannot find name for semaphore') from e
+    except (FileExistsError, AttributeError, ImportError, OSError) as e:
         mp = None
         warnings.warn('%s.  joblib will operate in serial mode' % (e,))
 
 
 # 3rd stage: backward compat for the assert_spawning helper
 if mp is not None:
-    try:
-        # Python 3.4+
-        from multiprocessing.context import assert_spawning
-    except ImportError:
-        from multiprocessing.forking import assert_spawning
+    from multiprocessing.context import assert_spawning
 else:
     assert_spawning = None

@@ -15,13 +15,8 @@ import struct
 import io
 import decimal
 
-from ._compat import _bytes_or_unicode, PY3_OR_LATER
 
-
-if PY3_OR_LATER:
-    Pickler = pickle._Pickler
-else:
-    Pickler = pickle.Pickler
+Pickler = pickle._Pickler
 
 
 class _ConsistentSet(object):
@@ -58,8 +53,7 @@ class Hasher(Pickler):
         self.stream = io.BytesIO()
         # By default we want a pickle protocol that only changes with
         # the major python version and not the minor one
-        protocol = (pickle.DEFAULT_PROTOCOL if PY3_OR_LATER
-                    else pickle.HIGHEST_PROTOCOL)
+        protocol = 3
         Pickler.__init__(self, self.stream, protocol=protocol)
         # Initialise the hash obj
         self._hash = hashlib.new(hash_name)
@@ -99,7 +93,7 @@ class Hasher(Pickler):
         # For example we want ['aa', 'aa'] and ['aa', 'aaZ'[:2]]
         # to hash to the same value and that's why we disable memoization
         # for strings
-        if isinstance(obj, _bytes_or_unicode):
+        if isinstance(obj, (bytes, str)):
             return
         Pickler.memoize(self, obj)
 
@@ -110,8 +104,7 @@ class Hasher(Pickler):
         # defined interactively in IPython that are not injected in
         # __main__
         kwargs = dict(name=name, pack=pack)
-        if sys.version_info >= (3, 4):
-            del kwargs['pack']
+        del kwargs['pack']
         try:
             Pickler.save_global(self, obj, **kwargs)
         except pickle.PicklingError:
@@ -200,7 +193,7 @@ class NumpyHasher(Hasher):
                 obj_c_contiguous = obj.T
             else:
                 # Cater for non-single-segment arrays: this creates a
-                # copy, and thus aleviates this issue.
+                # copy, and thus alleviates this issue.
                 # XXX: There might be a more efficient way of doing this
                 obj_c_contiguous = obj.flatten()
 
@@ -227,19 +220,24 @@ class NumpyHasher(Hasher):
             # The object will be pickled by the pickler hashed at the end.
             obj = (klass, ('HASHED', obj.dtype, obj.shape, obj.strides))
         elif isinstance(obj, self.np.dtype):
-            # Atomic dtype objects are interned by their default constructor:
-            # np.dtype('f8') is np.dtype('f8')
-            # This interning is not maintained by a
-            # pickle.loads + pickle.dumps cycle, because __reduce__
-            # uses copy=True in the dtype constructor. This
-            # non-deterministic behavior causes the internal memoizer
-            # of the hasher to generate different hash values
-            # depending on the history of the dtype object.
-            # To prevent the hash from being sensitive to this, we use
-            # .descr which is a full (and never interned) description of
-            # the array dtype according to the numpy doc.
-            klass = obj.__class__
-            obj = (klass, ('HASHED', obj.descr))
+            # numpy.dtype consistent hashing is tricky to get right. This comes
+            # from the fact that atomic np.dtype objects are interned:
+            # ``np.dtype('f4') is np.dtype('f4')``. The situation is
+            # complicated by the fact that this interning does not resist a
+            # simple pickle.load/dump roundtrip:
+            # ``pickle.loads(pickle.dumps(np.dtype('f4'))) is not
+            # np.dtype('f4') Because pickle relies on memoization during
+            # pickling, it is easy to
+            # produce different hashes for seemingly identical objects, such as
+            # ``[np.dtype('f4'), np.dtype('f4')]``
+            # and ``[np.dtype('f4'), pickle.loads(pickle.dumps('f4'))]``.
+            # To prevent memoization from interfering with hashing, we isolate
+            # the serialization (and thus the pickle memoization) of each dtype
+            # using each time a different ``pickle.dumps`` call unrelated to
+            # the current Hasher instance.
+            self._hash.update("_HASHED_DTYPE".encode('utf-8'))
+            self._hash.update(pickle.dumps(obj))
+            return
         Hasher.save(self, obj)
 
 
@@ -256,6 +254,11 @@ def hash(obj, hash_name='md5', coerce_mmap=False):
         coerce_mmap: boolean
             Make no difference between np.memmap and np.ndarray
     """
+    valid_hash_names = ('md5', 'sha1')
+    if hash_name not in valid_hash_names:
+        raise ValueError("Valid options for 'hash_name' are {}. "
+                         "Got hash_name={!r} instead."
+                         .format(valid_hash_names, hash_name))
     if 'numpy' in sys.modules:
         hasher = NumpyHasher(hash_name=hash_name, coerce_mmap=coerce_mmap)
     else:

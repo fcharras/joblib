@@ -6,19 +6,19 @@ Python**. In particular:
 
 2. easy simple parallel computing
 
-Joblib is optimized to be **fast** and **robust** in particular on large
-data and has specific optimizations for `numpy` arrays. It is
+Joblib is optimized to be **fast** and **robust** on large
+data in particular and has specific optimizations for `numpy` arrays. It is
 **BSD-licensed**.
 
 
     ==================== ===============================================
-    **Documentation:**       http://pythonhosted.org/joblib
+    **Documentation:**       https://joblib.readthedocs.io
 
-    **Download:**            http://pypi.python.org/pypi/joblib#downloads
+    **Download:**            https://pypi.python.org/pypi/joblib#downloads
 
-    **Source code:**         http://github.com/joblib/joblib
+    **Source code:**         https://github.com/joblib/joblib
 
-    **Report issues:**       http://github.com/joblib/joblib/issues
+    **Report issues:**       https://github.com/joblib/joblib/issues
     ==================== ===============================================
 
 
@@ -28,12 +28,12 @@ Vision
 The vision is to provide tools to easily achieve better performance and
 reproducibility when working with long running jobs.
 
- *  **Avoid computing twice the same thing**: code is rerun over an
-    over, for instance when prototyping computational-heavy jobs (as in
-    scientific development), but hand-crafted solution to alleviate this
-    issue is error-prone and often leads to unreproducible results
+ *  **Avoid computing the same thing twice**: code is often rerun again and
+    again, for instance when prototyping computational-heavy jobs (as in
+    scientific development), but hand-crafted solutions to alleviate this
+    issue are error-prone and often lead to unreproducible results.
 
- *  **Persist to disk transparently**: persisting in an efficient way
+ *  **Persist to disk transparently**: efficiently persisting
     arbitrary objects containing large data is hard. Using
     joblib's caching mechanism avoids hand-written persistence and
     implicitly links the file on disk to the execution context of
@@ -59,15 +59,15 @@ Main features
       >>> cachedir = 'your_cache_dir_goes_here'
       >>> mem = Memory(cachedir)
       >>> import numpy as np
-      >>> a = np.vander(np.arange(3)).astype(np.float)
+      >>> a = np.vander(np.arange(3)).astype(float)
       >>> square = mem.cache(np.square)
       >>> b = square(a)                                   # doctest: +ELLIPSIS
-      ________________________________________________________________________________
+      ______________________________________________________________________...
       [Memory] Calling square...
       square(array([[0., 0., 1.],
              [1., 1., 1.],
              [4., 2., 1.]]))
-      ___________________________________________________________square - 0...s, 0.0min
+      _________________________________________________...square - ...s, 0.0min
 
       >>> c = square(a)
       >>> # The above call did not trigger an evaluation
@@ -106,24 +106,33 @@ Main features
 # Dev branch marker is: 'X.Y.dev' or 'X.Y.devN' where N is an integer.
 # 'X.Y.dev0' is the canonical version of 'X.Y.dev'
 #
-__version__ = '0.11.1.dev0'
+__version__ = '1.3.0.dev0'
 
 
+import os
 from .memory import Memory, MemorizedResult, register_store_backend
 from .logger import PrintTime
 from .logger import Logger
 from .hashing import hash
 from .numpy_pickle import dump
 from .numpy_pickle import load
+from .compressor import register_compressor
 from .parallel import Parallel
 from .parallel import delayed
 from .parallel import cpu_count
 from .parallel import register_parallel_backend
 from .parallel import parallel_backend
 from .parallel import effective_n_jobs
+from ._cloudpickle_wrapper import wrap_non_picklable_objects
 
 
 __all__ = ['Memory', 'MemorizedResult', 'PrintTime', 'Logger', 'hash', 'dump',
            'load', 'Parallel', 'delayed', 'cpu_count', 'effective_n_jobs',
            'register_parallel_backend', 'parallel_backend',
-           'register_store_backend']
+           'register_store_backend', 'register_compressor',
+           'wrap_non_picklable_objects']
+
+
+# Workaround issue discovered in intel-openmp 2019.5:
+# https://github.com/ContinuumIO/anaconda-issues/issues/11294
+os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")

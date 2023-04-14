@@ -31,7 +31,8 @@ By default :class:`joblib.Parallel` uses the ``'loky'`` backend module to start
 separate Python worker processes to execute tasks concurrently on
 separate CPUs. This is a reasonable default for generic Python programs
 but can induce a significant overhead as the input and output data need
-to be serialized in a queue for communication with the worker processes.
+to be serialized in a queue for communication with the worker processes (see
+:ref:`serialization_and_processes`).
 
 When you know that the function you are calling is based on a compiled
 extension that releases the Python Global Interpreter Lock (GIL) during
@@ -68,7 +69,45 @@ In prior versions, the same effect could be achieved by hardcoding a
 specific backend implementation such as ``backend="threading"`` in the
 call to :class:`joblib.Parallel` but this is now considered a bad pattern
 (when done in a library) as it does not make it possible to override that
-choice with the ``parallel_backend`` context manager.
+choice with the :func:`~joblib.parallel_backend` context manager.
+
+
+.. topic:: The loky backend may not always be available
+
+   Some rare systems do not support multiprocessing (for instance
+   Pyodide). In this case the loky backend is not available and the
+   default backend falls back to threading.
+
+In addition to the builtin joblib backends, there are several cluster-specific
+backends you can use:
+
+* `Dask <https://docs.dask.org/en/stable/>`_ backend for Dask clusters
+  (see :ref:`sphx_glr_auto_examples_parallel_distributed_backend_simple.py` for an example),
+* `Ray <https://docs.ray.io/en/latest/index.html>`_ backend for Ray clusters,
+* `Joblib Apache Spark Backend <https://github.com/joblib/joblib-spark>`_
+  to distribute joblib tasks on a Spark cluster.
+
+.. _serialization_and_processes:
+
+Serialization & Processes
+=========================
+
+To share function definition across multiple python processes, it is necessary to rely on a serialization protocol. The standard protocol in python is :mod:`pickle` but its default implementation in the standard library has several limitations. For instance, it cannot serialize functions which are defined interactively or in the :code:`__main__` module.
+
+To avoid this limitation, the ``loky`` backend now relies on |cloudpickle| to serialize python objects. |cloudpickle| is an alternative implementation of the pickle protocol which allows the serialization of a greater number of objects, in particular interactively defined functions. So for most usages, the loky ``backend`` should work seamlessly.
+
+
+The main drawback of |cloudpickle| is that it can be slower than the :mod:`pickle` module in the standard library. In particular, it is critical for large python dictionaries or lists, where the serialization time can be up to 100 times slower. There is two ways to alter the serialization process for the ``joblib`` to temper this issue:
+
+- If you are on an UNIX system, you can switch back to the old ``multiprocessing`` backend. With this backend, interactively defined functions can be shared with the worker processes using the fast :mod:`pickle`. The main issue with this solution is that using ``fork`` to start the process breaks the standard POSIX and can have weird interaction with third party libraries such as ``numpy`` and ``openblas``.
+
+- If you wish to use the ``loky`` backend with a different serialization library, you can set the ``LOKY_PICKLER=mod_pickle`` environment variable to use the ``mod_pickle`` as the serialization library for ``loky``. The module ``mod_pickle`` passed as an argument should be importable as ``import mod_pickle`` and should contain a ``Pickler`` object, which will be used to serialize to objects. It can be set to ``LOKY_PICKLER=pickle`` to use the pickling module from stdlib. The main drawback with ``LOKY_PICKLER=pickle`` is that interactively defined functions will not be serializable anymore. To cope with this, you can use this solution together with the :func:`joblib.wrap_non_picklable_objects` wrapper, which can be used as a decorator to locally enable using |cloudpickle| for specific objects. This way, you can have fast pickling of all python objects and locally enable slow pickling for interactive functions. An example is given in loky_wrapper_.
+
+.. |cloudpickle| raw:: html
+
+    <a href="https://github.com/cloudpipe/cloudpickle"><code>cloudpickle</code></a>
+
+.. _loky_wrapper:  auto_examples/serialization_and_wrappers.html
 
 
 Shared-memory semantics
@@ -121,11 +160,61 @@ calls to the :class:`joblib.Parallel` object::
     >>> (accumulator, n_iter)                            # doctest: +ELLIPSIS
     (1136.596..., 14)
 
-.. include:: parallel_numpy.rst
-
 Note that the ``'loky'`` backend now used by default for process-based
 parallelism automatically tries to maintain and reuse a pool of workers
 by it-self even for calls without the context manager.
+
+.. include:: parallel_numpy.rst
+
+
+Avoiding over-subscription of CPU resources
+============================================
+
+The computation parallelism relies on the usage of multiple CPUs to perform the
+operation simultaneously. When using more processes than the number of CPU on
+a machine, the performance of each process is degraded as there is less
+computational power available for each process. Moreover, when many processes
+are running, the time taken by the OS scheduler to switch between them can
+further hinder the performance of the computation. It is generally better to
+avoid using significantly more processes or threads than the number of CPUs on
+a machine.
+
+Some third-party libraries -- *e.g.* the BLAS runtime used by ``numpy`` --
+internally manage a thread-pool to perform their computations. The default
+behavior is generally to use a number of threads equals to the number of CPUs
+available. When these libraries are used with :class:`joblib.Parallel`, each
+worker will spawn its own thread-pools, resulting in a massive over-subscription
+of resources that can slow down the computation compared to a sequential
+one. To cope with this problem, joblib tells supported third-party libraries
+to use a limited number of threads in workers managed by the ``'loky'``
+backend: by default each worker process will have environment variables set to
+allow a maximum of ``cpu_count() // n_jobs`` so that the total number of
+threads used by all the workers does not exceed the number of CPUs of the
+host.
+
+This behavior can be overridden by setting the proper environment variables to
+the desired number of threads. This override is supported for the following
+libraries:
+
+    - OpenMP with the environment variable ``'OMP_NUM_THREADS'``,
+    - OpenBLAS with the ``'OPENBLAS_NUM_THREADS'``,
+    - MKL with the environment variable ``'MKL_NUM_THREADS'``,
+    - Accelerated with the environment variable ``'VECLIB_MAXIMUM_THREADS'``,
+    - Numexpr with the environment variable ``'NUMEXPR_NUM_THREADS'``.
+
+Since joblib 0.14, it is also possible to programmatically override the default
+number of threads using the ``inner_max_num_threads`` argument of the
+:func:`~joblib.parallel_backend` function as follows:
+
+.. code-block:: python
+
+    from joblib import Parallel, delayed, parallel_backend
+
+    with parallel_backend("loky", inner_max_num_threads=2):
+        results = Parallel(n_jobs=4)(delayed(func)(x, y) for x, y in data)
+
+In this example, 4 Python worker processes will be allowed to use 2 threads
+each, meaning that this program will be able to use up to 8 CPUs concurrently.
 
 
 Custom backend API (experimental)
@@ -173,6 +262,36 @@ The connection parameters can then be passed to the
 Using the context manager can be helpful when using a third-party library that
 uses :class:`joblib.Parallel` internally while not exposing the ``backend``
 argument in its own API.
+
+
+A problem exists that external packages that register new parallel backends
+must now be imported explicitly for their backends to be identified by joblib::
+
+   >>> import joblib
+   >>> with joblib.parallel_backend('custom'):  # doctest: +SKIP
+   ...     ...  # this fails
+   KeyError: 'custom'
+
+   # Import library to register external backend
+   >>> import my_custom_backend_library  # doctest: +SKIP
+   >>> with joblib.parallel_backend('custom'):  # doctest: +SKIP
+   ...     ... # this works
+
+This can be confusing for users.  To resolve this, external packages can
+safely register their backends directly within the joblib codebase by creating
+a small function that registers their backend, and including this function
+within the ``joblib.parallel.EXTERNAL_PACKAGES`` dictionary::
+
+   def _register_custom():
+       try:
+           import my_custom_library
+       except ImportError:
+           raise ImportError("an informative error message")
+
+   EXTERNAL_BACKENDS['custom'] = _register_custom
+
+This is subject to community review, but can reduce the confusion for users
+when relying on side effects of external package imports.
 
 
 Old multiprocessing backend

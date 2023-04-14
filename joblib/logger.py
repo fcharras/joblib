@@ -81,8 +81,7 @@ class Logger(object):
         logging.debug("[%s]: %s" % (self, msg))
 
     def format(self, obj, indent=0):
-        """ Return the formated representation of the object.
-        """
+        """Return the formatted representation of the object."""
         return pformat(obj, indent=indent, depth=self.depth)
 
 
@@ -110,19 +109,19 @@ class PrintTime(object):
                     try:
                         shutil.move(logfile + '.%i' % i,
                                     logfile + '.%i' % (i + 1))
-                    except:
+                    except:  # noqa: E722
                         "No reason failing here"
                 # Use a copy rather than a move, so that a process
                 # monitoring this file does not get lost.
                 try:
                     shutil.copy(logfile, logfile + '.1')
-                except:
+                except:  # noqa: E722
                     "No reason failing here"
             try:
                 with open(logfile, 'w') as logfile:
                     logfile.write('\nLogging joblib python script\n')
                     logfile.write('\n---%s---\n' % time.ctime(self.last_time))
-            except:
+            except:  # noqa: E722
                 """ Multiprocessing writing to files can create race
                     conditions. Rather fail silently than crash the
                     computation.
@@ -147,7 +146,7 @@ class PrintTime(object):
             try:
                 with open(self.logfile, 'a') as f:
                     print(full_msg, file=f)
-            except:
+            except:  # noqa: E722
                 """ Multiprocessing writing to files can create race
                     conditions. Rather fail silently than crash the
                     calculation.

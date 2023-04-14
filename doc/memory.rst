@@ -41,7 +41,7 @@ A simple example:
 
     >>> cachedir = 'your_cache_location_directory'
 
-  Then, instanciate a memory context that uses this cache directory::
+  Then, instantiate a memory context that uses this cache directory::
 
     >>> from joblib import Memory
     >>> memory = Memory(cachedir, verbose=0)
@@ -95,7 +95,7 @@ Using with `numpy`
 
 The original motivation behind the `Memory` context was to have a
 memoize-like pattern on numpy arrays. `Memory` uses fast cryptographic
-hashing of the input arguments to check if they have been computed;
+hashing of the input arguments to check if they have been computed.
 
 An example
 ~~~~~~~~~~
@@ -145,14 +145,14 @@ arrays::
     >>> cachedir2 = 'your_cachedir2_location'
     >>> memory2 = Memory(cachedir2, mmap_mode='r')
     >>> square = memory2.cache(np.square)
-    >>> a = np.vander(np.arange(3)).astype(np.float)
+    >>> a = np.vander(np.arange(3)).astype(float)
     >>> square(a)
     ________________________________________________________________________________
     [Memory] Calling square...
     square(array([[0., 0., 1.],
            [1., 1., 1.],
            [4., 2., 1.]]))
-    ___________________________________________________________square - 0.0s, 0.0min
+    ___________________________________________________________square - ...min
     memmap([[ 0.,  0.,  1.],
             [ 1.,  1.,  1.],
             [16.,  4.,  1.]])
@@ -194,7 +194,7 @@ Shelving: using references to cached values
 
 In some cases, it can be useful to get a reference to the cached
 result, instead of having the result itself. A typical example of this
-is when a lot of large numpy arrays must be dispatched accross several
+is when a lot of large numpy arrays must be dispatched across several
 workers: instead of sending the data themselves over the network, send
 a reference to the joblib cache, and let the workers read the data
 from a network filesystem, potentially taking advantage of some
@@ -206,7 +206,7 @@ Getting a reference to the cache can be done using the
     >>> result = g.call_and_shelve(4)
     A long-running calculation, with parameter 4
     >>> result  #doctest: +ELLIPSIS
-    MemorizedResult(location="...", func="...g...", argument_hash="...")
+    MemorizedResult(location="...", func="...g...", args_id="...")
 
 Once computed, the output of `g` is stored on disk, and deleted from
 memory. Reading the associated value can then be performed with the
@@ -242,7 +242,7 @@ python interpreter.
 
 
 Gotchas
---------
+-------
 
 * **Across sessions, function cache is identified by the function's name**.
   Thus assigning the same name to different functions, their cache will
@@ -260,7 +260,7 @@ Gotchas
     ...     print('Running a different func(%s)' % x)
 
   As long as the same session is used, there are no collisions (in joblib
-  0.8 and above), altough joblib does warn you that you are doing something
+  0.8 and above), although joblib does warn you that you are doing something
   dangerous::
 
     >>> func(1)
@@ -332,7 +332,7 @@ Gotchas
   and use the cached function inside your class, i.e. something like
   this::
 
-    @mem.cache
+    @memory.cache
     def compute_func(arg1, arg2, arg3):
         # long computation
         return result
@@ -359,7 +359,7 @@ Gotchas
 
        class Foo(object):
 
-           @mem.cache  # WRONG
+           @memory.cache  # WRONG
            def method(self, args):
                pass
 
@@ -368,7 +368,7 @@ Gotchas
        class Foo(object):
 
            def __init__(self, args):
-               self.method = mem.cache(self.method)
+               self.method = memory.cache(self.method)
 
            def method(self, ...):
                pass
@@ -383,7 +383,16 @@ Gotchas
      create cache that will not be reused in subsequent calls. To
      alleviate these problems and if you *know* that the result of
      ``self.method`` does not depend on ``self`` you can use
-     ``self.method = mem.cache(self.method, ignore=['self'])``.
+     ``self.method = memory.cache(self.method, ignore=['self'])``.
+
+* **joblib cache entries may be invalidated after environment updates**.
+  Values returned by ``joblib.hash`` are not guaranteed to stay
+  constant across ``joblib`` versions. This means that **all** entries of a
+  ``joblib.Memory`` cache can get invalidated when upgrading ``joblib``.
+  Invalidation can also happen when upgrading a third party library (such as
+  ``numpy``): in such a case, only the cached function calls with parameters
+  that are constructs (or contain references to constructs) defined in the
+  upgraded library should potentially be invalidated after the upgrade.
 
 
 Ignoring some arguments
@@ -413,12 +422,29 @@ Reference documentation of the `Memory` class
 Useful methods of decorated functions
 -------------------------------------
 
-Function decorated by :meth:`Memory.cache` are :class:`MemorizedFunc`
+Functions decorated by :meth:`Memory.cache` are :class:`MemorizedFunc`
 objects that, in addition of behaving like normal functions, expose
-methods useful for cache exploration and management.
+methods useful for cache exploration and management. For example, you can
+use :meth:`func.check_call_in_cache <MemorizedFunc.check_call_in_cache>` to
+check if a cache hit will occur for a decorated ``func`` given a set of inputs
+without actually needing to call the function itself::
+
+    >>> @memory.cache
+    ... def func(x):
+    ...     print('Running func(%s)' % x)
+    ...     return x
+    >>> type(func)
+    <class 'joblib.memory.MemorizedFunc'>
+    >>> func(1)
+    Running func(1)
+    1
+    >>> func.check_call_in_cache(1)  # cache hit
+    True
+    >>> func.check_call_in_cache(2)  # cache miss
+    False
 
 .. autoclass:: MemorizedFunc
-    :members: __init__, call, clear
+    :members: __init__, call, clear, check_call_in_cache
 
 
 ..

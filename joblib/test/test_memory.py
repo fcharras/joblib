@@ -6,21 +6,19 @@ Test the memory module.
 # Copyright (c) 2009 Gael Varoquaux
 # License: BSD Style, 3 clauses.
 
+import functools
+import gc
 import shutil
 import os
 import os.path
+import pathlib
 import pickle
 import sys
 import time
 import datetime
-try:
-    # Python 2.7: use the C pickle to speed up
-    # test_concurrency_safe_write which pickles big python objects
-    import cPickle as cpickle
-except ImportError:
-    import pickle as cpickle
-import functools
+import textwrap
 
+import pytest
 
 from joblib.memory import Memory
 from joblib.memory import MemorizedFunc, NotMemorizedFunc
@@ -30,13 +28,11 @@ from joblib.memory import register_store_backend, _STORE_BACKENDS
 from joblib.memory import _build_func_identifier, _store_backend_factory
 from joblib.memory import JobLibCollisionWarning
 from joblib.parallel import Parallel, delayed
-from joblib._store_backends import StoreBackendBase
+from joblib._store_backends import StoreBackendBase, FileSystemStoreBackend
 from joblib.test.common import with_numpy, np
 from joblib.test.common import with_multiprocessing
-from joblib.testing import parametrize, raises, warns, timeout
-from joblib._compat import PY3_OR_LATER
-from joblib.backports import concurrency_safe_rename
-from joblib._store_backends import concurrency_safe_write
+from joblib.testing import parametrize, raises, warns
+from joblib.hashing import hash
 
 
 ###############################################################################
@@ -64,6 +60,26 @@ def check_identity_lazy(func, accumulator, location):
             assert len(accumulator) == i + 1
 
 
+def corrupt_single_cache_item(memory):
+    single_cache_item, = memory.store_backend.get_items()
+    output_filename = os.path.join(single_cache_item.path, 'output.pkl')
+    with open(output_filename, 'w') as f:
+        f.write('garbage')
+
+
+def monkeypatch_cached_func_warn(func, monkeypatch_fixture):
+    # Need monkeypatch because pytest does not
+    # capture stdlib logging output (see
+    # https://github.com/pytest-dev/pytest/issues/2079)
+
+    recorded = []
+
+    def append_to_record(item):
+        recorded.append(item)
+    monkeypatch_fixture.setattr(func, 'warn', append_to_record)
+    return recorded
+
+
 ###############################################################################
 # Tests
 def test_memory_integration(tmpdir):
@@ -74,9 +90,9 @@ def test_memory_integration(tmpdir):
     # thus it serves as a test to see that both are identified
     # as different.
 
-    def f(l):
+    def f(arg):
         accumulator.append(1)
-        return l
+        return arg
 
     check_identity_lazy(f, accumulator, tmpdir.strpath)
 
@@ -109,13 +125,112 @@ def test_memory_integration(tmpdir):
     memory.cache(f)(1)
 
 
+@parametrize("call_before_reducing", [True, False])
+def test_parallel_call_cached_function_defined_in_jupyter(
+    tmpdir, call_before_reducing
+):
+    # Calling an interactively defined memory.cache()'d function inside a
+    # Parallel call used to clear the existing cache related to the said
+    # function (https://github.com/joblib/joblib/issues/1035)
+
+    # This tests checks that this is no longer the case.
+
+    # TODO: test that the cache related to the function cache persists across
+    # ipython sessions (provided that no code change were made to the
+    # function's source)?
+
+    # The first part of the test makes the necessary low-level calls to emulate
+    # the definition of a function in an jupyter notebook cell. Joblib has
+    # some custom code to treat functions defined specifically in jupyter
+    # notebooks/ipython session -- we want to test this code, which requires
+    # the emulation to be rigorous.
+    for session_no in [0, 1]:
+        ipython_cell_source = '''
+        def f(x):
+            return x
+        '''
+
+        ipython_cell_id = '<ipython-input-{}-000000000000>'.format(session_no)
+
+        exec(
+            compile(
+                textwrap.dedent(ipython_cell_source),
+                filename=ipython_cell_id,
+                mode='exec'
+            )
+        )
+        # f is now accessible in the locals mapping - but for some unknown
+        # reason, f = locals()['f'] throws a KeyError at runtime, we need to
+        # bind locals()['f'] to a different name in the local namespace
+        aliased_f = locals()['f']
+        aliased_f.__module__ = "__main__"
+
+        # Preliminary sanity checks, and tests checking that joblib properly
+        # identified f as an interactive function defined in a jupyter notebook
+        assert aliased_f(1) == 1
+        assert aliased_f.__code__.co_filename == ipython_cell_id
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        cached_f = memory.cache(aliased_f)
+
+        assert len(os.listdir(tmpdir / 'joblib')) == 1
+        f_cache_relative_directory = os.listdir(tmpdir / 'joblib')[0]
+        assert 'ipython-input' in f_cache_relative_directory
+
+        f_cache_directory = tmpdir / 'joblib' / f_cache_relative_directory
+
+        if session_no == 0:
+            # The cache should be empty as cached_f has not been called yet.
+            assert os.listdir(f_cache_directory) == ['f']
+            assert os.listdir(f_cache_directory / 'f') == []
+
+            if call_before_reducing:
+                cached_f(3)
+                # Two files were just created, func_code.py, and a folder
+                # containing the information (inputs hash/ouptput) of
+                # cached_f(3)
+                assert len(os.listdir(f_cache_directory / 'f')) == 2
+
+                # Now, testing  #1035: when calling a cached function, joblib
+                # used to dynamically inspect the underlying function to
+                # extract its source code (to verify it matches the source code
+                # of the function as last inspected by joblib) -- however,
+                # source code introspection fails for dynamic functions sent to
+                # child processes - which would eventually make joblib clear
+                # the cache associated to f
+                res = Parallel(n_jobs=2)(delayed(cached_f)(i) for i in [1, 2])
+            else:
+                # Submit the function to the joblib child processes, although
+                # the function has never been called in the parent yet. This
+                # triggers a specific code branch inside
+                # MemorizedFunc.__reduce__.
+                res = Parallel(n_jobs=2)(delayed(cached_f)(i) for i in [1, 2])
+                assert len(os.listdir(f_cache_directory / 'f')) == 3
+
+                cached_f(3)
+
+            # Making sure f's cache does not get cleared after the parallel
+            # calls, and contains ALL cached functions calls (f(1), f(2), f(3))
+            # and 'func_code.py'
+            assert len(os.listdir(f_cache_directory / 'f')) == 4
+        else:
+            # For the second session, there should be an already existing cache
+            assert len(os.listdir(f_cache_directory / 'f')) == 4
+
+            cached_f(3)
+
+            # The previous cache should not be invalidated after calling the
+            # function in a new session
+            assert len(os.listdir(f_cache_directory / 'f')) == 4
+
+
 def test_no_memory():
     """ Test memory with location=None: no memoize """
     accumulator = list()
 
-    def ff(l):
+    def ff(arg):
         accumulator.append(1)
-        return l
+        return arg
 
     memory = Memory(location=None, verbose=0)
     gg = memory.cache(ff)
@@ -129,16 +244,16 @@ def test_memory_kwarg(tmpdir):
     " Test memory with a function with keyword arguments."
     accumulator = list()
 
-    def g(l=None, m=1):
+    def g(arg1=None, arg2=1):
         accumulator.append(1)
-        return l
+        return arg1
 
     check_identity_lazy(g, accumulator, tmpdir.strpath)
 
     memory = Memory(location=tmpdir.strpath, verbose=0)
     g = memory.cache(g)
     # Smoke test with an explicit keyword argument:
-    assert g(l=30, m=2) == 30
+    assert g(arg1=30, arg2=2) == 30
 
 
 def test_memory_lambda(tmpdir):
@@ -151,9 +266,7 @@ def test_memory_lambda(tmpdir):
         accumulator.append(1)
         return x
 
-    l = lambda x: helper(x)
-
-    check_identity_lazy(l, accumulator, tmpdir.strpath)
+    check_identity_lazy(lambda x: helper(x), accumulator, tmpdir.strpath)
 
 
 def test_memory_name_collision(tmpdir):
@@ -187,10 +300,8 @@ def test_memory_name_collision(tmpdir):
 def test_memory_warning_lambda_collisions(tmpdir):
     # Check that multiple use of lambda will raise collisions
     memory = Memory(location=tmpdir.strpath, verbose=0)
-    a = lambda x: x
-    a = memory.cache(a)
-    b = lambda x: x + 1
-    b = memory.cache(b)
+    a = memory.cache(lambda x: x)
+    b = memory.cache(lambda x: x + 1)
 
     with warns(JobLibCollisionWarning) as warninfo:
         assert a(0) == 0
@@ -249,7 +360,7 @@ def test_memory_eval(tmpdir):
 def count_and_append(x=[]):
     """ A function with a side effect in its arguments.
 
-        Return the lenght of its argument and append one element.
+        Return the length of its argument and append one element.
     """
     len_x = len(x)
     x.append(None)
@@ -276,9 +387,9 @@ def test_memory_numpy(tmpdir, mmap_mode):
     " Test memory with a function with numpy arrays."
     accumulator = list()
 
-    def n(l=None):
+    def n(arg=None):
         accumulator.append(1)
-        return l
+        return arg
 
     memory = Memory(location=tmpdir.strpath, mmap_mode=mmap_mode,
                     verbose=0)
@@ -293,7 +404,7 @@ def test_memory_numpy(tmpdir, mmap_mode):
 
 
 @with_numpy
-def test_memory_numpy_check_mmap_mode(tmpdir):
+def test_memory_numpy_check_mmap_mode(tmpdir, monkeypatch):
     """Check that mmap_mode is respected even at the first call"""
 
     memory = Memory(location=tmpdir.strpath, mmap_mode='r', verbose=0)
@@ -312,6 +423,24 @@ def test_memory_numpy_check_mmap_mode(tmpdir):
 
     assert isinstance(b, np.memmap)
     assert b.mode == 'r'
+
+    # Corrupts the file,  Deleting b and c mmaps
+    # is necessary to be able edit the file
+    del b
+    del c
+    gc.collect()
+    corrupt_single_cache_item(memory)
+
+    # Make sure that corrupting the file causes recomputation and that
+    # a warning is issued.
+    recorded_warnings = monkeypatch_cached_func_warn(twice, monkeypatch)
+    d = twice(a)
+    assert len(recorded_warnings) == 1
+    exception_msg = 'Exception while loading results'
+    assert exception_msg in recorded_warnings[0]
+    # Asserts that the recomputation returns a mmap
+    assert isinstance(d, np.memmap)
+    assert d.mode == 'r'
 
 
 def test_memory_exception(tmpdir):
@@ -355,6 +484,52 @@ def test_memory_ignore(tmpdir):
     assert len(accumulator) == 1
 
 
+def test_memory_ignore_decorated(tmpdir):
+    " Test the ignore feature of memory on a decorated function "
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+    accumulator = list()
+
+    def decorate(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            return f(*args, **kwargs)
+        return wrapped
+
+    @memory.cache(ignore=['y'])
+    @decorate
+    def z(x, y=1):
+        accumulator.append(1)
+
+    assert z.ignore == ['y']
+
+    z(0, y=1)
+    assert len(accumulator) == 1
+    z(0, y=1)
+    assert len(accumulator) == 1
+    z(0, y=2)
+    assert len(accumulator) == 1
+
+
+def test_memory_args_as_kwargs(tmpdir):
+    """Non-regression test against 0.12.0 changes.
+
+    https://github.com/joblib/joblib/pull/751
+    """
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+
+    @memory.cache
+    def plus_one(a):
+        return a + 1
+
+    # It's possible to call a positional arg as a kwarg.
+    assert plus_one(1) == 2
+    assert plus_one(a=1) == 2
+
+    # However, a positional argument that joblib hadn't seen
+    # before would cause a failure if it was passed as a kwarg.
+    assert plus_one(a=2) == 3
+
+
 @parametrize('ignore, verbose, mmap_mode', [(['x'], 100, 'r'),
                                             ([], 10, None)])
 def test_partial_decoration(tmpdir, ignore, verbose, mmap_mode):
@@ -384,10 +559,6 @@ def test_func_dir(tmpdir):
     assert location == path
     assert os.path.exists(path)
     assert memory.location == os.path.dirname(g.store_backend.location)
-    with warns(DeprecationWarning) as w:
-        assert memory.cachedir == g.store_backend.location
-    assert len(w) == 1
-    assert "The 'cachedir' attribute has been deprecated" in str(w[-1].message)
 
     # Test that the code is stored.
     # For the following test to be robust to previous execution, we clear
@@ -429,6 +600,19 @@ def test_persistence(tmpdir):
     gp(1)
 
 
+def test_check_call_in_cache(tmpdir):
+    for func in (MemorizedFunc(f, tmpdir.strpath),
+                 Memory(location=tmpdir.strpath, verbose=0).cache(f)):
+        result = func.check_call_in_cache(2)
+        assert not result
+        assert isinstance(result, bool)
+        assert func(2) == 5
+        result = func.check_call_in_cache(2)
+        assert result
+        assert isinstance(result, bool)
+        func.clear()
+
+
 def test_call_and_shelve(tmpdir):
     # Test MemorizedFunc outputting a reference to cache.
 
@@ -449,6 +633,55 @@ def test_call_and_shelve(tmpdir):
         with raises(KeyError):
             result.get()
         result.clear()  # Do nothing if there is no cache.
+
+
+def test_call_and_shelve_argument_hash(tmpdir):
+    # Verify that a warning is raised when accessing arguments_hash
+    # attribute from MemorizedResult
+    func = Memory(location=tmpdir.strpath, verbose=0).cache(f)
+    result = func.call_and_shelve(2)
+    assert isinstance(result, MemorizedResult)
+    with warns(DeprecationWarning) as w:
+        assert result.argument_hash == result.args_id
+    assert len(w) == 1
+    assert "The 'argument_hash' attribute has been deprecated" \
+        in str(w[-1].message)
+
+
+def test_call_and_shelve_lazily_load_stored_result(tmpdir):
+    """Check call_and_shelve only load stored data if needed."""
+    test_access_time_file = tmpdir.join('test_access')
+    test_access_time_file.write('test_access')
+    test_access_time = os.stat(test_access_time_file.strpath).st_atime
+    # check file system access time stats resolution is lower than test wait
+    # timings.
+    time.sleep(0.5)
+    assert test_access_time_file.read() == 'test_access'
+
+    if test_access_time == os.stat(test_access_time_file.strpath).st_atime:
+        # Skip this test when access time cannot be retrieved with enough
+        # precision from the file system (e.g. NTFS on windows).
+        pytest.skip("filesystem does not support fine-grained access time "
+                    "attribute")
+
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+    func = memory.cache(f)
+    func_id, argument_hash = func._get_output_identifiers(2)
+    result_path = os.path.join(memory.store_backend.location,
+                               func_id, argument_hash, 'output.pkl')
+    assert func(2) == 5
+    first_access_time = os.stat(result_path).st_atime
+    time.sleep(1)
+
+    # Should not access the stored data
+    result = func.call_and_shelve(2)
+    assert isinstance(result, MemorizedResult)
+    assert os.stat(result_path).st_atime == first_access_time
+    time.sleep(1)
+
+    # Read the stored data => last access time is greater than first_access
+    assert result.get() == 5
+    assert os.stat(result_path).st_atime > first_access_time
 
 
 def test_memorized_pickling(tmpdir):
@@ -585,47 +818,47 @@ def test_clear_memory_with_none_location():
     memory.clear()
 
 
-if PY3_OR_LATER:
-    exec("""
 def func_with_kwonly_args(a, b, *, kw1='kw1', kw2='kw2'):
     return a, b, kw1, kw2
 
+
 def func_with_signature(a: int, b: float) -> float:
     return a + b
-""")
 
-    def test_memory_func_with_kwonly_args(tmpdir):
-        memory = Memory(location=tmpdir.strpath, verbose=0)
-        func_cached = memory.cache(func_with_kwonly_args)
 
-        assert func_cached(1, 2, kw1=3) == (1, 2, 3, 'kw2')
+def test_memory_func_with_kwonly_args(tmpdir):
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+    func_cached = memory.cache(func_with_kwonly_args)
 
-        # Making sure that providing a keyword-only argument by
-        # position raises an exception
-        with raises(ValueError) as excinfo:
-            func_cached(1, 2, 3, kw2=4)
-        excinfo.match("Keyword-only parameter 'kw1' was passed as positional "
-                      "parameter")
+    assert func_cached(1, 2, kw1=3) == (1, 2, 3, 'kw2')
 
-        # Keyword-only parameter passed by position with cached call
-        # should still raise ValueError
-        func_cached(1, 2, kw1=3, kw2=4)
+    # Making sure that providing a keyword-only argument by
+    # position raises an exception
+    with raises(ValueError) as excinfo:
+        func_cached(1, 2, 3, kw2=4)
+    excinfo.match("Keyword-only parameter 'kw1' was passed as positional "
+                  "parameter")
 
-        with raises(ValueError) as excinfo:
-            func_cached(1, 2, 3, kw2=4)
-        excinfo.match("Keyword-only parameter 'kw1' was passed as positional "
-                      "parameter")
+    # Keyword-only parameter passed by position with cached call
+    # should still raise ValueError
+    func_cached(1, 2, kw1=3, kw2=4)
 
-        # Test 'ignore' parameter
-        func_cached = memory.cache(func_with_kwonly_args, ignore=['kw2'])
-        assert func_cached(1, 2, kw1=3, kw2=4) == (1, 2, 3, 4)
-        assert func_cached(1, 2, kw1=3, kw2='ignored') == (1, 2, 3, 4)
+    with raises(ValueError) as excinfo:
+        func_cached(1, 2, 3, kw2=4)
+    excinfo.match("Keyword-only parameter 'kw1' was passed as positional "
+                  "parameter")
 
-    def test_memory_func_with_signature(tmpdir):
-        memory = Memory(location=tmpdir.strpath, verbose=0)
-        func_cached = memory.cache(func_with_signature)
+    # Test 'ignore' parameter
+    func_cached = memory.cache(func_with_kwonly_args, ignore=['kw2'])
+    assert func_cached(1, 2, kw1=3, kw2=4) == (1, 2, 3, 4)
+    assert func_cached(1, 2, kw1=3, kw2='ignored') == (1, 2, 3, 4)
 
-        assert func_cached(1, 2.) == 3.
+
+def test_memory_func_with_signature(tmpdir):
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+    func_cached = memory.cache(func_with_signature)
+
+    assert func_cached(1, 2.) == 3.
 
 
 def _setup_toy_cache(tmpdir, num_inputs=10):
@@ -740,10 +973,13 @@ def test_memory_reduce_size(tmpdir):
 
 
 def test_memory_clear(tmpdir):
-    memory, _, _ = _setup_toy_cache(tmpdir)
+    memory, _, g = _setup_toy_cache(tmpdir)
     memory.clear()
 
     assert os.listdir(memory.store_backend.location) == []
+
+    # Check that the cache for functions hash is also reset.
+    assert not g._check_previous_func_code(stacklevel=4)
 
 
 def fast_func_with_complex_output():
@@ -800,50 +1036,8 @@ def test_cached_function_race_condition_when_persisting_output_2(tmpdir,
     assert exception_msg not in stderr
 
 
-def write_func(output, filename):
-    with open(filename, 'wb') as f:
-        cpickle.dump(output, f)
-
-
-def concurrency_safe_write_rename(to_write, filename, write_func):
-    temporary_filename = concurrency_safe_write(to_write,
-                                                filename, write_func)
-    concurrency_safe_rename(temporary_filename, filename)
-
-
-def load_func(expected, filename):
-    for i in range(10):
-        try:
-            with open(filename, 'rb') as f:
-                reloaded = cpickle.load(f)
-            break
-        except (OSError, IOError):
-            # On Windows you can have WindowsError ([Error 5] Access
-            # is denied or [Error 13] Permission denied) when reading the file,
-            # probably because a writer process has a lock on the file
-            time.sleep(0.1)
-    else:
-        raise
-    assert expected == reloaded
-
-
-@timeout(0)  # No timeout as this test can be long
-@with_multiprocessing
-@parametrize('backend', ['multiprocessing', 'loky', 'threading'])
-def test_concurrency_safe_write(tmpdir, backend):
-    # Add one item to cache
-    filename = tmpdir.join('test.pkl').strpath
-
-    obj = {str(i): i for i in range(int(1e5))}
-    funcs = [functools.partial(concurrency_safe_write_rename,
-                               write_func=write_func)
-             if i % 3 != 2 else load_func for i in range(12)]
-    Parallel(n_jobs=2, backend=backend)(
-        delayed(func)(obj, filename) for func in funcs)
-
-
-def test_memory_recomputes_after_an_error_why_loading_results(tmpdir,
-                                                              monkeypatch):
+def test_memory_recomputes_after_an_error_while_loading_results(
+        tmpdir, monkeypatch):
     memory = Memory(location=tmpdir.strpath)
 
     def func(arg):
@@ -862,21 +1056,11 @@ def test_memory_recomputes_after_an_error_why_loading_results(tmpdir,
 
     # Corrupting output.pkl to make sure that an error happens when
     # loading the cached result
-    single_cache_item, = memory.store_backend.get_items()
-    output_filename = os.path.join(single_cache_item.path, 'output.pkl')
-    with open(output_filename, 'w') as f:
-        f.write('garbage')
-
-    recorded_warnings = []
-
-    def append_to_record(item):
-        recorded_warnings.append(item)
+    corrupt_single_cache_item(memory)
 
     # Make sure that corrupting the file causes recomputation and that
-    # a warning is issued. Need monkeypatch because pytest does not
-    # capture stdlib logging output (see
-    # https://github.com/pytest-dev/pytest/issues/2079)
-    monkeypatch.setattr(cached_func, 'warn', append_to_record)
+    # a warning is issued.
+    recorded_warnings = monkeypatch_cached_func_warn(cached_func, monkeypatch)
     recomputed_arg, recomputed_timestamp = cached_func(arg)
     assert len(recorded_warnings) == 1
     exception_msg = 'Exception while loading results'
@@ -884,32 +1068,23 @@ def test_memory_recomputes_after_an_error_why_loading_results(tmpdir,
     assert recomputed_arg == arg
     assert recomputed_timestamp > timestamp
 
-
-def test_deprecated_cachedir_behaviour(tmpdir):
-    # verify the right deprecation warnings are raised when using cachedir
-    # option instead of new location parameter.
-    with warns(None) as w:
-        memory = Memory(cachedir=tmpdir.strpath, verbose=0)
-        assert memory.store_backend.location.startswith(tmpdir.strpath)
-
-    assert len(w) == 1
-    assert "The 'cachedir' parameter has been deprecated" in str(w[-1].message)
-
-    with warns(None) as w:
-        memory = Memory()
-        assert memory.cachedir is None
-
-    assert len(w) == 1
-    assert "The 'cachedir' attribute has been deprecated" in str(w[-1].message)
-
-    error_regex = """You set both "location='.+ and "cachedir='.+"""
-    with raises(ValueError, match=error_regex):
-        memory = Memory(location=tmpdir.strpath, cachedir=tmpdir.strpath,
-                        verbose=0)
+    # Corrupting output.pkl to make sure that an error happens when
+    # loading the cached result
+    corrupt_single_cache_item(memory)
+    reference = cached_func.call_and_shelve(arg)
+    try:
+        reference.get()
+        raise AssertionError(
+            "It normally not possible to load a corrupted"
+            " MemorizedResult"
+        )
+    except KeyError as e:
+        message = "is corrupted"
+        assert message in str(e.args)
 
 
 class IncompleteStoreBackend(StoreBackendBase):
-    """This backend cannot be instanciated and should raise a TypeError."""
+    """This backend cannot be instantiated and should raise a TypeError."""
     pass
 
 
@@ -966,15 +1141,29 @@ def test_register_invalid_store_backends_object():
 
 
 def test_memory_default_store_backend():
-    # test an unknow backend falls back into a FileSystemStoreBackend
+    # test an unknown backend falls back into a FileSystemStoreBackend
     with raises(TypeError) as excinfo:
         Memory(location='/tmp/joblib', backend='unknown')
     excinfo.match(r"Unknown location*")
 
 
+def test_warning_on_unknown_location_type():
+    class NonSupportedLocationClass:
+        pass
+    unsupported_location = NonSupportedLocationClass()
+
+    with warns(UserWarning) as warninfo:
+        _store_backend_factory("local", location=unsupported_location)
+
+    expected_mesage = ("Instantiating a backend using a "
+                       "NonSupportedLocationClass as a location is not "
+                       "supported by joblib")
+    assert expected_mesage in str(warninfo[0].message)
+
+
 def test_instanciate_incomplete_store_backend():
     # Verify that registering an external incomplete store backend raises an
-    # exception when one tries to instanciate it.
+    # exception when one tries to instantiate it.
     backend_name = "isb"
     register_store_backend(backend_name, IncompleteStoreBackend)
     assert (backend_name, IncompleteStoreBackend) in _STORE_BACKENDS.items()
@@ -993,3 +1182,130 @@ def test_dummy_store_backend():
 
     backend_obj = _store_backend_factory(backend_name, "dummy_location")
     assert isinstance(backend_obj, DummyStoreBackend)
+
+
+def test_instanciate_store_backend_with_pathlib_path():
+    # Instantiate a FileSystemStoreBackend using a pathlib.Path object
+    path = pathlib.Path("some_folder")
+    backend_obj = _store_backend_factory("local", path)
+    assert backend_obj.location == "some_folder"
+
+
+def test_filesystem_store_backend_repr(tmpdir):
+    # Verify string representation of a filesystem store backend.
+
+    repr_pattern = 'FileSystemStoreBackend(location="{location}")'
+    backend = FileSystemStoreBackend()
+    assert backend.location is None
+
+    repr(backend)  # Should not raise an exception
+
+    assert str(backend) == repr_pattern.format(location=None)
+
+    # backend location is passed explicitly via the configure method (called
+    # by the internal _store_backend_factory function)
+    backend.configure(tmpdir.strpath)
+
+    assert str(backend) == repr_pattern.format(location=tmpdir.strpath)
+
+    repr(backend)  # Should not raise an exception
+
+
+def test_memory_objects_repr(tmpdir):
+    # Verify printable reprs of MemorizedResult, MemorizedFunc and Memory.
+
+    def my_func(a, b):
+        return a + b
+
+    memory = Memory(location=tmpdir.strpath, verbose=0)
+    memorized_func = memory.cache(my_func)
+
+    memorized_func_repr = 'MemorizedFunc(func={func}, location={location})'
+
+    assert str(memorized_func) == memorized_func_repr.format(
+        func=my_func,
+        location=memory.store_backend.location)
+
+    memorized_result = memorized_func.call_and_shelve(42, 42)
+
+    memorized_result_repr = ('MemorizedResult(location="{location}", '
+                             'func="{func}", args_id="{args_id}")')
+
+    assert str(memorized_result) == memorized_result_repr.format(
+        location=memory.store_backend.location,
+        func=memorized_result.func_id,
+        args_id=memorized_result.args_id)
+
+    assert str(memory) == 'Memory(location={location})'.format(
+        location=memory.store_backend.location)
+
+
+def test_memorized_result_pickle(tmpdir):
+    # Verify a MemoryResult object can be pickled/depickled. Non regression
+    # test introduced following issue
+    # https://github.com/joblib/joblib/issues/747
+
+    memory = Memory(location=tmpdir.strpath)
+
+    @memory.cache
+    def g(x):
+        return x**2
+
+    memorized_result = g.call_and_shelve(4)
+    memorized_result_pickle = pickle.dumps(memorized_result)
+    memorized_result_loads = pickle.loads(memorized_result_pickle)
+
+    assert memorized_result.store_backend.location == \
+        memorized_result_loads.store_backend.location
+    assert memorized_result.func == memorized_result_loads.func
+    assert memorized_result.args_id == memorized_result_loads.args_id
+    assert str(memorized_result) == str(memorized_result_loads)
+
+
+def compare(left, right, ignored_attrs=None):
+    if ignored_attrs is None:
+        ignored_attrs = []
+
+    left_vars = vars(left)
+    right_vars = vars(right)
+    assert set(left_vars.keys()) == set(right_vars.keys())
+    for attr in left_vars.keys():
+        if attr in ignored_attrs:
+            continue
+        assert left_vars[attr] == right_vars[attr]
+
+
+@pytest.mark.parametrize('memory_kwargs',
+                         [{'compress': 3, 'verbose': 2},
+                          {'mmap_mode': 'r', 'verbose': 5, 'bytes_limit': 1e6,
+                           'backend_options': {'parameter': 'unused'}}])
+def test_memory_pickle_dump_load(tmpdir, memory_kwargs):
+    memory = Memory(location=tmpdir.strpath, **memory_kwargs)
+
+    memory_reloaded = pickle.loads(pickle.dumps(memory))
+
+    # Compare Memory instance before and after pickle roundtrip
+    compare(memory.store_backend, memory_reloaded.store_backend)
+    compare(memory, memory_reloaded,
+            ignored_attrs=set(['store_backend', 'timestamp', '_func_code_id']))
+    assert hash(memory) == hash(memory_reloaded)
+
+    func_cached = memory.cache(f)
+
+    func_cached_reloaded = pickle.loads(pickle.dumps(func_cached))
+
+    # Compare MemorizedFunc instance before/after pickle roundtrip
+    compare(func_cached.store_backend, func_cached_reloaded.store_backend)
+    compare(func_cached, func_cached_reloaded,
+            ignored_attrs=set(['store_backend', 'timestamp', '_func_code_id']))
+    assert hash(func_cached) == hash(func_cached_reloaded)
+
+    # Compare MemorizedResult instance before/after pickle roundtrip
+    memorized_result = func_cached.call_and_shelve(1)
+    memorized_result_reloaded = pickle.loads(pickle.dumps(memorized_result))
+
+    compare(memorized_result.store_backend,
+            memorized_result_reloaded.store_backend)
+    compare(memorized_result, memorized_result_reloaded,
+            ignored_attrs=set(['store_backend', 'timestamp', '_func_code_id']))
+    assert hash(memorized_result) == hash(memorized_result_reloaded)

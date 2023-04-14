@@ -12,6 +12,7 @@ is called with the same input arguments.
 from __future__ import with_statement
 import os
 import time
+import pathlib
 import pydoc
 import re
 import functools
@@ -20,15 +21,16 @@ import warnings
 import inspect
 import weakref
 
+from tokenize import open as open_py_source
+
 # Local imports
 from . import hashing
 from .func_inspect import get_func_code, get_func_name, filter_args
 from .func_inspect import format_call
 from .func_inspect import format_signature
-from ._memory_helpers import open_py_source
 from .logger import Logger, format_time, pformat
-from ._compat import _basestring, PY3_OR_LATER
 from ._store_backends import StoreBackendBase, FileSystemStoreBackend
+from ._store_backends import CacheWarning  # noqa
 
 
 FIRST_LINE_TEXT = "# first line:"
@@ -85,7 +87,7 @@ def register_store_backend(backend_name, backend):
         The name of a class that implements the StoreBackendBase interface.
 
     """
-    if not isinstance(backend_name, _basestring):
+    if not isinstance(backend_name, str):
         raise ValueError("Store backend name should be a string, "
                          "'{0}' given.".format(backend_name))
     if backend is None or not issubclass(backend, StoreBackendBase):
@@ -96,11 +98,17 @@ def register_store_backend(backend_name, backend):
     _STORE_BACKENDS[backend_name] = backend
 
 
-def _store_backend_factory(backend, location, verbose=0, backend_options={}):
+def _store_backend_factory(backend, location, verbose=0, backend_options=None):
     """Return the correct store object for the given location."""
+    if backend_options is None:
+        backend_options = {}
+
+    if isinstance(location, pathlib.Path):
+        location = str(location)
+
     if isinstance(location, StoreBackendBase):
         return location
-    elif isinstance(location, _basestring):
+    elif isinstance(location, str):
         obj = None
         location = os.path.expanduser(location)
         # The location is not a local file system, we look in the
@@ -121,6 +129,11 @@ def _store_backend_factory(backend, location, verbose=0, backend_options={}):
         obj.configure(location, verbose=verbose,
                       backend_options=backend_options)
         return obj
+    elif location is not None:
+        warnings.warn(
+            "Instantiating a backend using a {} as a location is not "
+            "supported by joblib. Returning None instead.".format(
+                location.__class__.__name__), UserWarning)
 
     return None
 
@@ -135,7 +148,7 @@ def _get_func_fullname(func):
 def _build_func_identifier(func):
     """Build a roughly unique identifier for the cached function."""
     parts = []
-    if isinstance(func, _basestring):
+    if isinstance(func, str):
         parts.append(func)
     else:
         parts.append(_get_func_fullname(func))
@@ -184,7 +197,7 @@ class MemorizedResult(Logger):
 
     func: function or str
         function whose output is cached. The string case is intended only for
-        instanciation based on the output of repr() on another instance.
+        instantiation based on the output of repr() on another instance.
         (namely eval(repr(memorized_instance)) works).
 
     argument_hash: str
@@ -207,8 +220,11 @@ class MemorizedResult(Logger):
     def __init__(self, location, func, args_id, backend='local',
                  mmap_mode=None, verbose=0, timestamp=None, metadata=None):
         Logger.__init__(self)
-        self.func = func
         self.func_id = _build_func_identifier(func)
+        if isinstance(func, str):
+            self.func = func
+        else:
+            self.func = self.func_id
         self.args_id = args_id
         self.store_backend = _store_backend_factory(backend, location,
                                                     verbose=verbose)
@@ -224,6 +240,15 @@ class MemorizedResult(Logger):
         self.verbose = verbose
         self.timestamp = timestamp
 
+    @property
+    def argument_hash(self):
+        warnings.warn(
+            "The 'argument_hash' attribute has been deprecated in version "
+            "0.12 and will be removed in version 0.14.\n"
+            "Use `args_id` attribute instead.",
+            DeprecationWarning, stacklevel=2)
+        return self.args_id
+
     def get(self):
         """Read value from cache and return it."""
         if self.verbose:
@@ -232,8 +257,19 @@ class MemorizedResult(Logger):
                                    metadata=self.metadata)
         else:
             msg = None
-        return self.store_backend.load_item(
-            [self.func_id, self.args_id], msg=msg, verbose=self.verbose)
+
+        try:
+            return self.store_backend.load_item(
+                [self.func_id, self.args_id], msg=msg, verbose=self.verbose)
+        except ValueError as exc:
+            new_exc = KeyError(
+                "Error while trying to load a MemorizedResult's value. "
+                "It seems that this folder is corrupted : {}".format(
+                    os.path.join(
+                        self.store_backend.location, self.func_id,
+                        self.args_id)
+                ))
+            raise new_exc from exc
 
     def clear(self):
         """Clear value from cache"""
@@ -241,17 +277,17 @@ class MemorizedResult(Logger):
 
     def __repr__(self):
         return ('{class_name}(location="{location}", func="{func}", '
-                'argument_hash="{argument_hash}")'
+                'args_id="{args_id}")'
                 .format(class_name=self.__class__.__name__,
-                        location=self.store_backend,
+                        location=self.store_backend.location,
                         func=self.func,
-                        argument_hash=self.args_id
+                        args_id=self.args_id
                         ))
 
-    def __reduce__(self):
-        return (self.__class__,
-                (self.store_backend, self.func, self.args_id),
-                {'mmap_mode': self.mmap_mode})
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['timestamp'] = None
+        return state
 
 
 class NotMemorizedResult(object):
@@ -316,15 +352,18 @@ class NotMemorizedFunc(object):
     def call_and_shelve(self, *args, **kwargs):
         return NotMemorizedResult(self.func(*args, **kwargs))
 
-    def __reduce__(self):
-        return (self.__class__, (self.func,))
-
     def __repr__(self):
         return '{0}(func={1})'.format(self.__class__.__name__, self.func)
 
     def clear(self, warn=True):
         # Argument "warn" is for compatibility with MemorizedFunc.clear
         pass
+
+    def call(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+    def check_call_in_cache(self, *args, **kwargs):
+        return False
 
 
 ###############################################################################
@@ -378,6 +417,7 @@ class MemorizedFunc(Logger):
         self.mmap_mode = mmap_mode
         self.compress = compress
         self.func = func
+
         if ignore is None:
             ignore = []
         self.ignore = ignore
@@ -400,7 +440,7 @@ class MemorizedFunc(Logger):
         self.timestamp = timestamp
         try:
             functools.update_wrapper(self, func)
-        except:
+        except:  # noqa: E722
             " Objects like ufunc don't like that "
         if inspect.isfunction(func):
             doc = pydoc.TextDoc().document(func)
@@ -413,47 +453,57 @@ class MemorizedFunc(Logger):
             doc = func.__doc__
         self.__doc__ = 'Memoized version of %s' % doc
 
-    def _cached_call(self, args, kwargs):
+        self._func_code_info = None
+        self._func_code_id = None
+
+    def _cached_call(self, args, kwargs, shelving=False):
         """Call wrapped function and cache result, or read cache if available.
 
         This function returns the wrapped function output and some metadata.
 
+        Arguments:
+        ----------
+
+        args, kwargs: list and dict
+            input arguments for wrapped function
+
+        shelving: bool
+            True when called via the call_and_shelve function.
+
+
         Returns
         -------
-        output: value or tuple
-            what is returned by wrapped function
+        output: value or tuple or None
+            Output of the wrapped function.
+            If shelving is True and the call has been already cached,
+            output is None.
 
         argument_hash: string
-            hash of function arguments
+            Hash of function arguments.
 
         metadata: dict
-            some metadata about wrapped function call (see _persist_input())
+            Some metadata about wrapped function call (see _persist_input()).
         """
-        # Compare the function code with the previous to see if the
-        # function code has changed
         func_id, args_id = self._get_output_identifiers(*args, **kwargs)
         metadata = None
         msg = None
+
+        # Whether or not the memorized function must be called
+        must_call = False
+
         # FIXME: The statements below should be try/excepted
+        # Compare the function code with the previous to see if the
+        # function code has changed
         if not (self._check_previous_func_code(stacklevel=4) and
                 self.store_backend.contains_item([func_id, args_id])):
             if self._verbose > 10:
                 _, name = get_func_name(self.func)
-                self.warn('Computing func %{0}, argument hash %{1} '
-                          'in location %{2}'
+                self.warn('Computing func {0}, argument hash {1} '
+                          'in location {2}'
                           .format(name, args_id,
                                   self.store_backend.
                                   get_cached_func_info([func_id])['location']))
-            out, metadata = self.call(*args, **kwargs)
-            if self.mmap_mode is not None:
-                # Memmap the output at the first call to be consistent with
-                # later calls
-                if self._verbose:
-                    msg = _format_load_msg(func_id, args_id,
-                                           timestamp=self.timestamp,
-                                           metadata=metadata)
-                out = self.store_backend.load_item([func_id, args_id], msg=msg,
-                                                   verbose=self._verbose)
+            must_call = True
         else:
             try:
                 t0 = time.time()
@@ -461,8 +511,16 @@ class MemorizedFunc(Logger):
                     msg = _format_load_msg(func_id, args_id,
                                            timestamp=self.timestamp,
                                            metadata=metadata)
-                out = self.store_backend.load_item([func_id, args_id], msg=msg,
-                                                   verbose=self._verbose)
+
+                if not shelving:
+                    # When shelving, we do not need to load the output
+                    out = self.store_backend.load_item(
+                        [func_id, args_id],
+                        msg=msg,
+                        verbose=self._verbose)
+                else:
+                    out = None
+
                 if self._verbose > 4:
                     t = time.time() - t0
                     _, name = get_func_name(self.func)
@@ -474,10 +532,44 @@ class MemorizedFunc(Logger):
                 self.warn('Exception while loading results for '
                           '{}\n {}'.format(signature, traceback.format_exc()))
 
-                out, metadata = self.call(*args, **kwargs)
-                args_id = None
+                must_call = True
+
+        if must_call:
+            out, metadata = self.call(*args, **kwargs)
+            if self.mmap_mode is not None:
+                # Memmap the output at the first call to be consistent with
+                # later calls
+                if self._verbose:
+                    msg = _format_load_msg(func_id, args_id,
+                                           timestamp=self.timestamp,
+                                           metadata=metadata)
+                out = self.store_backend.load_item([func_id, args_id], msg=msg,
+                                                   verbose=self._verbose)
 
         return (out, args_id, metadata)
+
+    @property
+    def func_code_info(self):
+        # 3-tuple property containing: the function source code, source file,
+        # and first line of the code inside the source file
+        if hasattr(self.func, '__code__'):
+            if self._func_code_id is None:
+                self._func_code_id = id(self.func.__code__)
+            elif id(self.func.__code__) != self._func_code_id:
+                # Be robust to dynamic reassignments of self.func.__code__
+                self._func_code_info = None
+
+        if self._func_code_info is None:
+            # Cache the source code of self.func . Provided that get_func_code
+            # (which should be called once on self) gets called in the process
+            # in which self.func was defined, this caching mechanism prevents
+            # undesired cache clearing when the cached function is called in
+            # an environment where the introspection utilities get_func_code
+            # relies on do not work (typically, in joblib child processes).
+            # See #1035 for  more info
+            # TODO (pierreglaser): do the same with get_func_name?
+            self._func_code_info = get_func_code(self.func)
+        return self._func_code_info
 
     def call_and_shelve(self, *args, **kwargs):
         """Call wrapped function, cache result and return a reference.
@@ -494,7 +586,7 @@ class MemorizedFunc(Logger):
             class "NotMemorizedResult" is used when there is no cache
             activated (e.g. location=None in Memory).
         """
-        _, args_id, metadata = self._cached_call(args, kwargs)
+        _, args_id, metadata = self._cached_call(args, kwargs, shelving=True)
         return MemorizedResult(self.store_backend, self.func, args_id,
                                metadata=metadata, verbose=self._verbose - 1,
                                timestamp=self.timestamp)
@@ -502,13 +594,36 @@ class MemorizedFunc(Logger):
     def __call__(self, *args, **kwargs):
         return self._cached_call(args, kwargs)[0]
 
-    def __reduce__(self):
-        """ We don't store the timestamp when pickling, to avoid the hash
-            depending from it.
-            In addition, when unpickling, we run the __init__
+    def __getstate__(self):
+        # Make sure self.func's source is introspected prior to being pickled -
+        # code introspection utilities typically do not work inside child
+        # processes
+        _ = self.func_code_info
+
+        # We don't store the timestamp when pickling, to avoid the hash
+        # depending from it.
+        state = self.__dict__.copy()
+        state['timestamp'] = None
+
+        # Invalidate the code id as id(obj) will be different in the child
+        state['_func_code_id'] = None
+
+        return state
+
+    def check_call_in_cache(self, *args, **kwargs):
+        """Check if function call is in the memory cache.
+
+        Does not call the function or do any work besides func inspection
+        and arg hashing.
+
+        Returns
+        -------
+        is_call_in_cache: bool
+            Whether or not the result of the function has been cached
+            for the input arguments that have been passed.
         """
-        return (self.__class__, (self.func, self.store_backend, self.ignore,
-                self.mmap_mode, self.compress, self._verbose))
+        func_id, args_id = self._get_output_identifiers(*args, **kwargs)
+        return self.store_backend.contains_item((func_id, args_id))
 
     # ------------------------------------------------------------------------
     # Private interface
@@ -543,12 +658,8 @@ class MemorizedFunc(Logger):
 
         # Also store in the in-memory store of function hashes
         is_named_callable = False
-        if PY3_OR_LATER:
-            is_named_callable = (hasattr(self.func, '__name__') and
-                                 self.func.__name__ != '<lambda>')
-        else:
-            is_named_callable = (hasattr(self.func, 'func_name') and
-                                 self.func.func_name != '<lambda>')
+        is_named_callable = (hasattr(self.func, '__name__') and
+                             self.func.__name__ != '<lambda>')
         if is_named_callable:
             # Don't do this for lambda functions or strange callable
             # objects, as it ends up being too fragile
@@ -583,7 +694,7 @@ class MemorizedFunc(Logger):
         # Here, we go through some effort to be robust to dynamically
         # changing code and collision. We cannot inspect.getsource
         # because it is not reliable when using IPython's magic "%run".
-        func_code, source_file, first_line = get_func_code(self.func)
+        func_code, source_file, first_line = self.func_code_info
         func_id = _build_func_identifier(self.func)
 
         try:
@@ -591,8 +702,8 @@ class MemorizedFunc(Logger):
                 extract_first_line(
                     self.store_backend.get_cached_func_code([func_id]))
         except (IOError, OSError):  # some backend can also raise OSError
-                self._write_func_code(func_code, first_line)
-                return False
+            self._write_func_code(func_code, first_line)
+            return False
         if old_func_code == func_code:
             return True
 
@@ -642,7 +753,7 @@ class MemorizedFunc(Logger):
         # XXX: Should be using warnings, and giving stacklevel
         if self._verbose > 10:
             _, func_name = get_func_name(self.func, resolv_alias=False)
-            self.warn("Function %{0} (identified by %{1}) has changed"
+            self.warn("Function {0} (identified by {1}) has changed"
                       ".".format(func_name, func_id))
         self.clear(warn=True)
         return False
@@ -655,12 +766,28 @@ class MemorizedFunc(Logger):
             self.warn("Clearing function cache identified by %s" % func_id)
         self.store_backend.clear_path([func_id, ])
 
-        func_code, _, first_line = get_func_code(self.func)
+        func_code, _, first_line = self.func_code_info
         self._write_func_code(func_code, first_line)
 
     def call(self, *args, **kwargs):
-        """ Force the execution of the function with the given arguments and
-            persist the output values.
+        """Force the execution of the function with the given arguments.
+
+        The output values will be persisted, i.e., the cache will be updated
+        with any new values.
+
+        Parameters
+        ----------
+        *args: arguments
+            The arguments.
+        **kwargs: keyword arguments
+            Keyword arguments.
+
+        Returns
+        -------
+        output : object
+            The output of the function call.
+        metadata : dict
+            The metadata associated with the call.
         """
         start_time = time.time()
         func_id, args_id = self._get_output_identifiers(*args, **kwargs)
@@ -716,29 +843,24 @@ class MemorizedFunc(Logger):
             # for which repr() always output a short representation, but can
             # be with complex dictionaries. Fixing the problem should be a
             # matter of replacing repr() above by something smarter.
-            warnings.warn("Persisting input arguments took %.2fs to run.\n"
+            warnings.warn("Persisting input arguments took %.2fs to run."
                           "If this happens often in your code, it can cause "
-                          "performance problems \n"
-                          "(results will be correct in all cases). \n"
+                          "performance problems "
+                          "(results will be correct in all cases). "
                           "The reason for this is probably some large input "
-                          "arguments for a wrapped\n"
-                          " function (e.g. large strings).\n"
-                          "THIS IS A JOBLIB ISSUE. If you can, kindly provide "
-                          "the joblib's team with an\n"
-                          " example so that they can fix the problem."
+                          "arguments for a wrapped function."
                           % this_duration, stacklevel=5)
         return metadata
-
-    # XXX: Need a method to check if results are available.
 
     # ------------------------------------------------------------------------
     # Private `object` interface
     # ------------------------------------------------------------------------
 
     def __repr__(self):
-        return ("{0}(func={1}, location={2})".format(self.__class__.__name__,
-                                                     self.func,
-                                                     self.store_backend,))
+        return '{class_name}(func={func}, location={location})'.format(
+            class_name=self.__class__.__name__,
+            func=self.func,
+            location=self.store_backend.location,)
 
 
 ###############################################################################
@@ -755,7 +877,7 @@ class Memory(Logger):
 
         Parameters
         ----------
-        location: str or None
+        location: str, pathlib.Path or None
             The path of the base directory to use as a data store
             or None. If None is given, no caching is done and
             the Memory object is completely transparent. This option
@@ -766,12 +888,6 @@ class Memory(Logger):
             Default: 'local'.
             The 'local' backend is using regular filesystem operations to
             manipulate data (open, mv, etc) in the backend.
-
-        cachedir: str or None, optional
-
-            .. deprecated: 0.12
-                'cachedir' has been deprecated in 0.12 and will be
-                removed in 0.14. Use the 'location' parameter instead.
 
         mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional
             The memmapping mode used when loading from cache
@@ -789,65 +905,47 @@ class Memory(Logger):
             as functions are evaluated.
 
         bytes_limit: int, optional
-            Limit in bytes of the size of the cache.
+            Limit in bytes of the size of the cache. By default, the size of
+            the cache is unlimited. When reducing the size of the cache,
+            ``joblib`` keeps the most recently accessed items first.
+
+            **Note:** You need to call :meth:`joblib.Memory.reduce_size` to
+            actually reduce the cache size to be less than ``bytes_limit``.
 
         backend_options: dict, optional
-            Contains a dictionnary of named parameters used to configure
+            Contains a dictionary of named parameters used to configure
             the store backend.
     """
     # ------------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------------
 
-    def __init__(self, location=None, backend='local', cachedir=None,
+    def __init__(self, location=None, backend='local',
                  mmap_mode=None, compress=False, verbose=1, bytes_limit=None,
-                 backend_options={}):
-        # XXX: Bad explanation of the None value of cachedir
+                 backend_options=None):
         Logger.__init__(self)
         self._verbose = verbose
         self.mmap_mode = mmap_mode
         self.timestamp = time.time()
         self.bytes_limit = bytes_limit
         self.backend = backend
+        self.compress = compress
+        if backend_options is None:
+            backend_options = {}
+        self.backend_options = backend_options
+
         if compress and mmap_mode is not None:
             warnings.warn('Compressed results cannot be memmapped',
                           stacklevel=2)
-        if cachedir is not None:
-            if location is not None:
-                raise ValueError(
-                    'You set both "location={0!r} and "cachedir={1!r}". '
-                    "'cachedir' has been deprecated in version "
-                    "0.12 and will be removed in version 0.14.\n"
-                    'Please only set "location={0!r}"'.format(
-                        location, cachedir))
-
-            warnings.warn(
-                "The 'cachedir' parameter has been deprecated in version "
-                "0.12 and will be removed in version 0.14.\n"
-                'You provided "cachedir={!r}", '
-                'use "location={!r}" instead.'.format(cachedir, location),
-                DeprecationWarning, stacklevel=2)
-            location = cachedir
 
         self.location = location
-        if isinstance(location, _basestring):
+        if isinstance(location, str):
             location = os.path.join(location, 'joblib')
 
         self.store_backend = _store_backend_factory(
             backend, location, verbose=self._verbose,
             backend_options=dict(compress=compress, mmap_mode=mmap_mode,
                                  **backend_options))
-
-    @property
-    def cachedir(self):
-        warnings.warn(
-            "The 'cachedir' attribute has been deprecated in version 0.12 "
-            "and will be removed in version 0.14.\n"
-            "Use os.path.join(memory.location, 'joblib') attribute instead.",
-            DeprecationWarning, stacklevel=2)
-        if self.location is None:
-            return None
-        return os.path.join(self.location, 'joblib')
 
     def cache(self, func=None, ignore=None, verbose=None, mmap_mode=False):
         """ Decorates the given function func to only compute its return
@@ -888,9 +986,11 @@ class Memory(Logger):
             mmap_mode = self.mmap_mode
         if isinstance(func, MemorizedFunc):
             func = func.func
-        return MemorizedFunc(func, self.store_backend, mmap_mode=mmap_mode,
-                             ignore=ignore, verbose=verbose,
-                             timestamp=self.timestamp)
+        return MemorizedFunc(func, location=self.store_backend,
+                             backend=self.backend,
+                             ignore=ignore, mmap_mode=mmap_mode,
+                             compress=self.compress,
+                             verbose=verbose, timestamp=self.timestamp)
 
     def clear(self, warn=True):
         """ Erase the complete cache directory.
@@ -899,6 +999,12 @@ class Memory(Logger):
             self.warn('Flushing completely the cache')
         if self.store_backend is not None:
             self.store_backend.clear()
+
+            # As the cache in completely clear, make sure the _FUNCTION_HASHES
+            # cache is also reset. Else, for a function that is present in this
+            # table, results cached after this clear will be have cache miss
+            # as the function code is not re-written.
+            _FUNCTION_HASHES.clear()
 
     def reduce_size(self):
         """Remove cache elements to make cache size fit in ``bytes_limit``."""
@@ -923,19 +1029,15 @@ class Memory(Logger):
     # ------------------------------------------------------------------------
 
     def __repr__(self):
-        return '{0}(location={1})'.format(
-            self.__class__.__name__, (repr(None) if self.store_backend is None
-                                      else repr(self.store_backend)))
+        return '{class_name}(location={location})'.format(
+            class_name=self.__class__.__name__,
+            location=(None if self.store_backend is None
+                      else self.store_backend.location))
 
-    def __reduce__(self):
+    def __getstate__(self):
         """ We don't store the timestamp when pickling, to avoid the hash
             depending from it.
-            In addition, when unpickling, we run the __init__
         """
-        # We need to remove 'joblib' from the end of cachedir
-        location = (repr(self.store_backend)[:-7]
-                    if self.store_backend is not None else None)
-        compress = self.store_backend.compress \
-            if self.store_backend is not None else False
-        return (self.__class__, (location, self.backend, self.mmap_mode,
-                                 compress, self._verbose))
+        state = self.__dict__.copy()
+        state['timestamp'] = None
+        return state

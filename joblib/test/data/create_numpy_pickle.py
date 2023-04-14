@@ -64,7 +64,8 @@ def write_test_pickle(to_pickle, args):
         print("Error: cannot generate file '{}' with arguments '{}'. "
               "Error was: {}".format(pickle_filename, kwargs, e))
     else:
-        print("File '{}' generated successfuly.".format(pickle_filename))
+        print("File '{}' generated successfully.".format(pickle_filename))
+
 
 if __name__ == '__main__':
     import argparse
@@ -76,7 +77,7 @@ if __name__ == '__main__':
     parser.add_argument('--compress', action="store_true",
                         help="Generate compress pickles.")
     parser.add_argument('--method', type=str, default='zlib',
-                        choices=['zlib', 'gzip', 'bz2', 'xz', 'lzma'],
+                        choices=['zlib', 'gzip', 'bz2', 'xz', 'lzma', 'lz4'],
                         help="Set compression method.")
     # We need to be specific about dtypes in particular endianness
     # because the pickles can be generated on one architecture and
@@ -86,10 +87,7 @@ if __name__ == '__main__':
                  np.arange(5, dtype=np.dtype('<f8')),
                  np.array([1, 'abc', {'a': 1, 'b': 2}], dtype='O'),
                  # all possible bytes as a byte string
-                 # .tostring actually returns bytes and is a
-                 # compatibility alias for .tobytes which was
-                 # added in 1.9.0
-                 np.arange(256, dtype=np.uint8).tostring(),
+                 np.arange(256, dtype=np.uint8).tobytes(),
                  np.matrix([0, 1, 2], dtype=np.dtype('<i8')),
                  # unicode string with non-ascii chars
                  u"C'est l'\xe9t\xe9 !"]

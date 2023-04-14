@@ -1,5 +1,6 @@
 """Storage providers backends for Memory caching."""
 
+from pickle import PicklingError
 import re
 import os
 import os.path
@@ -12,13 +13,17 @@ import operator
 import threading
 from abc import ABCMeta, abstractmethod
 
-from ._compat import with_metaclass, _basestring
 from .backports import concurrency_safe_rename
 from .disk import mkdirp, memstr_to_bytes, rm_subdirs
 from . import numpy_pickle
 
 CacheItemInfo = collections.namedtuple('CacheItemInfo',
                                        'path size last_access')
+
+
+class CacheWarning(Warning):
+    """Warning to capture dump failures except for PicklingError."""
+    pass
 
 
 def concurrency_safe_write(object_to_write, filename, write_func):
@@ -31,9 +36,11 @@ def concurrency_safe_write(object_to_write, filename, write_func):
     return temporary_filename
 
 
-class StoreBackendBase(with_metaclass(ABCMeta)):
+class StoreBackendBase(metaclass=ABCMeta):
     """Helper Abstract Base Class which defines all methods that
        a StorageBackend must implement."""
+
+    location = None
 
     @abstractmethod
     def _open_item(self, f, mode):
@@ -129,7 +136,7 @@ class StoreBackendBase(with_metaclass(ABCMeta)):
         verbose: int
             The level of verbosity of the store
         backend_options: dict
-            Contains a dictionnary of named paremeters used to configure the
+            Contains a dictionary of named parameters used to configure the
             store backend.
         """
 
@@ -184,12 +191,24 @@ class StoreBackendMixin(object):
 
             def write_func(to_write, dest_filename):
                 with self._open_item(dest_filename, "wb") as f:
-                    numpy_pickle.dump(to_write, f,
-                                      compress=self.compress)
+                    try:
+                        numpy_pickle.dump(to_write, f, compress=self.compress)
+                    except PicklingError as e:
+                        # TODO(1.5) turn into error
+                        warnings.warn(
+                            "Unable to cache to disk: failed to pickle "
+                            "output. In version 1.5 this will raise an "
+                            f"exception. Exception: {e}.",
+                            FutureWarning
+                        )
 
             self._concurrency_safe_write(item, filename, write_func)
-        except:  # noqa: E722
-            " Race condition in the creation of the directory "
+        except Exception as e:  # noqa: E722
+            warnings.warn(
+                "Unable to cache to disk. Possibly a race condition in the "
+                f"creation of the directory. Exception: {e}.",
+                CacheWarning
+            )
 
     def clear_item(self, path):
         """Clear the item at the path, given as a list of strings."""
@@ -285,15 +304,15 @@ class StoreBackendMixin(object):
             try:
                 self.clear_location(item.path)
             except OSError:
-                # Even with ignore_errors=True can shutil.rmtree
-                # can raise OSErrror with [Errno 116] Stale file
-                # handle if another process has deleted the folder
-                # already.
+                # Even with ignore_errors=True shutil.rmtree can raise OSError
+                # with:
+                # [Errno 116] Stale file handle if another process has deleted
+                # the folder already.
                 pass
 
     def _get_items_to_delete(self, bytes_limit):
         """Get items to delete to keep the store under a size limit."""
-        if isinstance(bytes_limit, _basestring):
+        if isinstance(bytes_limit, str):
             bytes_limit = memstr_to_bytes(bytes_limit)
 
         items = self.get_items()
@@ -327,7 +346,8 @@ class StoreBackendMixin(object):
 
     def __repr__(self):
         """Printable representation of the store location."""
-        return self.location
+        return '{class_name}(location="{location}")'.format(
+            class_name=self.__class__.__name__, location=self.location)
 
 
 class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
@@ -384,11 +404,13 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
 
         return items
 
-    def configure(self, location, verbose=1, backend_options={}):
+    def configure(self, location, verbose=1, backend_options=None):
         """Configure the store backend.
 
         For this backend, valid store options are 'compress' and 'mmap_mode'
         """
+        if backend_options is None:
+            backend_options = {}
 
         # setup location directory
         self.location = location
@@ -396,17 +418,15 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
             mkdirp(self.location)
 
         # item can be stored compressed for faster I/O
-        self.compress = backend_options['compress']
+        self.compress = backend_options.get('compress', False)
 
         # FileSystemStoreBackend can be used with mmap_mode options under
         # certain conditions.
-        mmap_mode = None
-        if 'mmap_mode' in backend_options:
-            mmap_mode = backend_options['mmap_mode']
-            if self.compress and mmap_mode is not None:
-                warnings.warn('Compressed items cannot be memmapped in a '
-                              'filesystem store. Option will be ignored.',
-                              stacklevel=2)
+        mmap_mode = backend_options.get('mmap_mode')
+        if self.compress and mmap_mode is not None:
+            warnings.warn('Compressed items cannot be memmapped in a '
+                          'filesystem store. Option will be ignored.',
+                          stacklevel=2)
 
         self.mmap_mode = mmap_mode
         self.verbose = verbose
